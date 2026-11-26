@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         My Survey Control
 // @namespace    my-survey-guard
-// @version      1.4.0
-// @description  Admin Approval + Blocklist + Repeat-survey detection + 7/15/30-day locks
+// @version      1.6.0
+// @description  Admin Approval + Blocklist (links too) + Repeat detection + Auto-lock completed surveys + Duration
 // @match        *://*/*
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/sagorking1/my-survey-guard/main/my-survey-control.user.js
@@ -27,7 +27,7 @@
   const GITHUB_USER = 'sagorking1';
   const GITHUB_REPO = 'my-survey-guard';
 
-  const SCRIPT_VERSION = '1.4.0';
+  const SCRIPT_VERSION = '1.6.0';
   const CONFIG_URL = `https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/main/config.json`;
   const REFRESH_MS = 60 * 1000;
   const DAY = 24 * 60 * 60 * 1000;
@@ -94,6 +94,18 @@
     const m = Math.min(lenA, lenB);
     return shared >= 4 || (shared >= 3 && m > 0 && shared / m >= 0.5);
   }
+  // Survey শেষ হয়েছে কিনা (Thank-you পেজ) বোঝার চেষ্টা। Screen-out/অযোগ্য হলে false।
+  function isCompletionText(text, url) {
+    const t = norm(text).slice(0, 5000);
+    const u = String(url || '').toLowerCase();
+    if (/(screen(ed)? ?out|not eligible|do not qualify|don't qualify|unfortunately|disqualif|quota (is )?(full|reached)|terminated|over quota)/.test(t)) return false;
+    if (/\/(thank-?you|thanks|completed?|finish(ed)?|survey-?end|end-?page)(\/|\.|\?|$)/.test(u)) return true;
+    return /thank(s| you)[^.!\n]{0,40}(completing|your participation|taking part|for your time|your feedback|your responses|participating)/.test(t)
+      || /(survey|questionnaire) (is |has been |was )?(complete|completed|finished|submitted)\b/.test(t)
+      || /you('ve| have) (successfully )?(completed|finished)/.test(t)
+      || /your (responses?|answers?) (has|have) been (recorded|submitted|saved)/.test(t)
+      || /submission (received|complete)/.test(t);
+  }
   // </PURE>
 
   // ================= Storage =================
@@ -113,7 +125,7 @@
     }
     return id;
   }
-  const ACCESS_ID = getAccessId();
+  let ACCESS_ID = getAccessId();
 
   // ---------- State ----------
   let status = 'PENDING'; // PENDING | ACTIVE | BLOCKED | ERROR
@@ -185,7 +197,7 @@
     } else {
       stopProtectedFeatures();
     }
-    if (prev !== status || !menusReady) setMenus();
+    if (prev !== status || cfgChanged || !menusReady) setMenus();
   }
 
   // ================= UI helpers =================
@@ -408,7 +420,10 @@
     repeatTimer = setTimeout(runRepeatCheck, 1500);
   }
   function runRepeatCheck() {
-    if (status !== 'ACTIVE' || !isSurveyLike() || document.getElementById('msc-overlay')) return;
+    if (status !== 'ACTIVE') return;
+    markLinks();
+    if (document.getElementById('msc-overlay')) return;
+    if (!isSurveyLike()) { tryCompletion(); return; }
     const qs = extractQuestions();
     if (!qs.length) return;
     const now = Date.now();
@@ -435,9 +450,13 @@
         }
       }
     }
-    if (!cur) { cur = { id, host: location.hostname, title: '', q: [], first: now, last: now }; list.push(cur); }
+    if (!cur) { cur = { id, host: location.hostname, title: '', q: [], first: now, last: now, ss: now, dur: 0 }; list.push(cur); }
+    if (!cur.ss || now - cur.last > 30 * 60 * 1000) cur.ss = now; // নতুন সেশন
     cur.q = merged;
     cur.last = now;
+    cur.dur = now - cur.ss;
+    ssSet('lastSurvey', id);
+    ssSet('lastSurveyAt', String(now));
     cur.title = (document.title || '').slice(0, 80);
     list.sort((a, b) => a.last - b.last);
     save('surveys', list.slice(-400));
@@ -445,16 +464,96 @@
   function showLog() {
     const list = load('surveys', []).slice().sort((a, b) => b.last - a.last).slice(0, 20);
     if (!list.length) { alert('এখনো কোনো Survey Log নেই।'); return; }
-    alert('সর্বশেষ Survey (সর্বোচ্চ ২০টি):\n\n' + list.map((s) => `${fmt(s.last)}  ${s.host}\n   ${s.title || '-'}  (${(s.q || []).length} প্রশ্ন)`).join('\n\n'));
+    alert('সর্বশেষ Survey (সর্বোচ্চ ২০টি):\n\n' + list.map((s) => `${fmt(s.last)}  ${s.host}\n   ${s.title || '-'}  (${(s.q || []).length} প্রশ্ন, ${Math.round((s.dur || 0) / 60000)} মিনিট${s.done ? ', সম্পন্ন ✅' : ''})`).join('\n\n'));
   }
   function clearLog() {
     if (confirm('Survey Log মুছে ফেলবেন? (লক মুছবে না)')) { save('surveys', []); toast('Log মুছে ফেলা হয়েছে'); }
+  }
+
+  // ================= সম্পন্ন Survey অটো-লক =================
+  const autoLockDays = () => parseInt(GM_getValue('autoLockDays', '7'), 10) || 0;
+  function touchSurvey() {
+    try {
+      const sid = ssGet('lastSurvey');
+      if (!sid) return;
+      const list = load('surveys', []);
+      const rec = list.find((x) => x.id === sid);
+      if (!rec) return;
+      const now = Date.now();
+      rec.last = now;
+      rec.dur = now - (rec.ss || rec.first);
+      save('surveys', list);
+    } catch (e) { /* ignore */ }
+  }
+  function tryCompletion() {
+    const days = autoLockDays();
+    const sid = ssGet('lastSurvey');
+    if (!days || !sid || ssGet('doneFor') === sid) return;
+    if (Date.now() - parseInt(ssGet('lastSurveyAt') || '0', 10) > 3 * 3600 * 1000) return;
+    const text = (document.body && document.body.innerText || '').slice(0, 5000);
+    if (!isCompletionText(text, location.pathname + location.search)) return;
+    ssSet('doneFor', sid);
+    const now = Date.now();
+    const list = load('surveys', []);
+    const rec = list.find((x) => x.id === sid);
+    if (rec) { rec.done = now; rec.dur = now - (rec.ss || rec.first); save('surveys', list); }
+    const locks = getLocks();
+    locks['survey:' + sid] = { until: now + days * DAY, days, set: now, auto: true };
+    save('locks', locks);
+    toast(`✅ Survey সম্পন্ন মনে হচ্ছে। ${days} দিনের জন্য লক হয়েছে`);
+  }
+  function setAutoLock() {
+    const v = prompt('সম্পন্ন Survey কত দিন অটো-লক থাকবে? (0 = বন্ধ, 7, 15 বা 30)', String(autoLockDays()));
+    if (v === null) return;
+    const n = parseInt(v, 10);
+    if (![0, 7, 15, 30].includes(n)) { alert('শুধু 0, 7, 15 বা 30 লিখুন।'); return; }
+    GM_setValue('autoLockDays', String(n));
+    toast(n ? `⚙️ Auto-lock: ${n} দিন` : '⚙️ Auto-lock বন্ধ');
+    setMenus();
+  }
+
+  // ================= পেজের লিংকে Blocklist =================
+  const inOwnUi = (n) => !!(n.closest && n.closest('#msc-box,#msc-overlay,#msc-banner,#msc-toast'));
+  function linkHit(a) {
+    let u;
+    try { u = new URL(a.href, location.href); } catch (e) { return null; }
+    if (!/^https?:$/.test(u.protocol)) return null;
+    return matchBlocklist(cfg, u.hostname, u.host + u.pathname + u.search, '', '');
+  }
+  function resetLinkMarks() {
+    document.querySelectorAll('a[data-msc]').forEach((a) => {
+      a.removeAttribute('data-msc');
+      if (a.hasAttribute('data-msc-block')) { a.removeAttribute('data-msc-block'); a.style.outline = ''; if ((a.title || '').startsWith('⛔')) a.removeAttribute('title'); }
+    });
+  }
+  function markLinks() {
+    const as = document.querySelectorAll('a[href]:not([data-msc])');
+    let n = 0;
+    for (const a of as) {
+      if (n++ > 400) break;
+      if (inOwnUi(a)) continue;
+      a.setAttribute('data-msc', '1');
+      const hit = linkHit(a);
+      if (hit) { a.setAttribute('data-msc-block', hit); a.style.outline = '2px solid #dc2626'; a.title = '⛔ Blocklist: ' + hit; }
+    }
+  }
+  function onLinkClick(e) {
+    const a = e.target && e.target.closest && e.target.closest('a[href]');
+    if (!a || inOwnUi(a)) return;
+    const hit = a.getAttribute('data-msc-block') || (a.hasAttribute('data-msc') ? null : linkHit(a));
+    if (!hit) return;
+    if (!confirm('⛔ এই লিংক Blocklist-এ আছে:\n' + hit + '\n\nতবুও খুলবেন?')) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+    }
   }
 
   // ================= মূল পরীক্ষা =================
   function checkPage() {
     removeOverlay();
     if (status !== 'ACTIVE') return;
+    resetLinkMarks();
     const ignored = ssGet('ignore:' + urlKey()) === '1';
     if (!ignored) {
       const lock = activeLock();
@@ -470,6 +569,7 @@
         isSurveyLike() ? (document.body && document.body.innerText || '').slice(0, 20000) : ''
       );
       if (hit) {
+        recordBlock(hit);
         showOverlay('Blocklist-এ আছে', [cfg.message || 'এই survey/website blocklist-এ আছে। এখানে কাজ বা survey continue করবেন না।', hit]);
         return;
       }
@@ -497,6 +597,9 @@
       });
       observer.observe(document.body, { childList: true, subtree: true });
     } catch (e) { /* ignore */ }
+    document.addEventListener('click', onLinkClick, true);
+    document.addEventListener('auxclick', onLinkClick, true);
+    window.addEventListener('pagehide', touchSurvey);
     hrefTimer = setInterval(() => {
       if (location.href !== lastHref) { lastHref = location.href; idChecked = false; warned.clear(); checkPage(); }
     }, 1500);
@@ -508,8 +611,143 @@
     if (observer) { observer.disconnect(); observer = null; }
     clearInterval(hrefTimer);
     clearTimeout(repeatTimer);
+    document.removeEventListener('click', onLinkClick, true);
+    document.removeEventListener('auxclick', onLinkClick, true);
+    window.removeEventListener('pagehide', touchSurvey);
+    resetLinkMarks();
     removeOverlay();
     removeBanner();
+  }
+
+  // ================= Log / Backup / Debug =================
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtFull = (t) => {
+    const d = new Date(t);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
+  const countOf = (a) => (Array.isArray(a) ? a.length : 0);
+
+  function download(name, text, type) {
+    const blob = new Blob([text], { type: type || 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.documentElement.append(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+  const csvCell = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+
+  function downloadCsv(label, sinceMs) {
+    const list = load('surveys', []).filter((s) => s.last >= sinceMs).sort((a, b) => b.last - a.last);
+    if (!list.length) { alert('এই সময়ের মধ্যে কোনো Survey Log নেই।'); return; }
+    const rows = [['Last seen', 'First seen', 'Site', 'Title', 'Questions', 'Minutes', 'Completed', 'Page']].concat(
+      list.map((s) => [fmtFull(s.last), fmtFull(s.first), s.host, s.title, (s.q || []).length, Math.round((s.dur || 0) / 60000), s.done ? 'yes' : '', s.id]));
+    download(`survey-log-${label}.csv`, '﻿' + rows.map((r) => r.map(csvCell).join(',')).join('\r\n'), 'text/csv;charset=utf-8');
+    toast(`📥 ${list.length}টি Survey ডাউনলোড হয়েছে`);
+  }
+
+  function backup() {
+    const data = { app: 'my-survey-control', version: SCRIPT_VERSION, savedAt: Date.now(), surveys: load('surveys', []), locks: getLocks(), blocked: load('blockedHistory', []) };
+    download(`my-survey-control-backup-${fmtFull(Date.now()).slice(0, 10)}.json`, JSON.stringify(data), 'application/json');
+    toast('💾 Backup ডাউনলোড হয়েছে');
+  }
+  function importBackup() {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.json,application/json';
+    inp.onchange = () => {
+      const f = inp.files && inp.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => {
+        try {
+          const d = JSON.parse(String(r.result));
+          if (!d || d.app !== 'my-survey-control') throw new Error('এটি My Survey Control-এর Backup ফাইল নয়');
+          const map = new Map(load('surveys', []).map((s) => [s.id, s]));
+          (d.surveys || []).forEach((s) => {
+            if (!s || !s.id) return;
+            const o = map.get(s.id);
+            if (!o) map.set(s.id, s);
+            else {
+              o.q = [...new Set([...(o.q || []), ...(s.q || [])])].slice(-300);
+              o.first = Math.min(o.first || s.first, s.first || o.first);
+              o.last = Math.max(o.last || 0, s.last || 0);
+            }
+          });
+          save('surveys', [...map.values()].sort((a, b) => a.last - b.last).slice(-400));
+          const locks = getLocks();
+          Object.keys(d.locks || {}).forEach((k) => {
+            const v = d.locks[k];
+            if (v && v.until > Date.now() && (!locks[k] || locks[k].until < v.until)) locks[k] = v;
+          });
+          save('locks', locks);
+          toast('✅ Backup মার্জ হয়েছে');
+          checkPage();
+        } catch (e) { alert('Import ব্যর্থ: ' + e.message); }
+      };
+      r.readAsText(f);
+    };
+    inp.click();
+  }
+
+  function recordBlock(reason) {
+    const list = load('blockedHistory', []);
+    const u = location.host + location.pathname;
+    const now = Date.now();
+    const last = list[list.length - 1];
+    if (last && last.u === u && last.r === reason && now - last.t < 60000) return;
+    list.push({ t: now, u, r: reason });
+    save('blockedHistory', list.slice(-50));
+  }
+  function showBlockedHistory() {
+    const list = load('blockedHistory', []).slice().reverse();
+    if (!list.length) { alert('এখনো কোনো Blocked ইতিহাস নেই।'); return; }
+    alert('Blocked ইতিহাস (শেষ ৫০):\n\n' + list.map((x) => `${fmtFull(x.t)}  ${x.u}\n   ${x.r}`).join('\n'));
+  }
+
+  function currentHit() {
+    return matchBlocklist(
+      cfg, location.hostname, location.host + location.pathname + location.search, document.title,
+      isSurveyLike() ? (document.body && document.body.innerText || '').slice(0, 20000) : ''
+    );
+  }
+  function whyBlocked() {
+    const lock = activeLock();
+    const hit = currentHit();
+    if (lock) alert(`এই পেজ লক করা আছে (শেষ: ${fmt(lock.until)})।`);
+    else if (hit) alert('এই পেজ Blocklist-এ আছে।\nকারণ: ' + hit);
+    else alert('এই পেজ ব্লক নয়।');
+  }
+  function debugScan() {
+    const lock = activeLock();
+    alert([
+      `Status: ${status}${lastError ? ' (' + lastError + ')' : ''}`,
+      `Access ID: ${ACCESS_ID}`,
+      `Config: ${cfgStamp ? 'আনা হয়েছে' : 'আনা যায়নি'}`,
+      `Survey-মতো পেজ: ${isSurveyLike() ? 'হ্যাঁ' : 'না'} (রেডিও/চেকবক্স: ${radioCount()})`,
+      `চেনা প্রশ্ন: ${extractQuestions().length}`,
+      `লক: ${lock ? 'আছে' : 'নেই'}`,
+      `Blocklist: ${currentHit() || 'মেলেনি'}`,
+    ].join('\n'));
+  }
+  function showListInfo() {
+    alert(`Admin list${cfg.listVersion ? ' v' + cfg.listVersion : ''}:\n• Domain: ${countOf(cfg.blockedDomains)}\n• Keyword: ${countOf(cfg.blockedKeywords)}\n• Survey: ${countOf(cfg.blockedSurveys)}\n• Allowed ID: ${countOf(cfg.allowedIds)}\n• Blocked ID: ${countOf(cfg.blockedIds)}`);
+  }
+  async function refreshListNow() {
+    await refreshStatus();
+    toast(status === 'ERROR' ? 'List আনা যায়নি: ' + lastError : '🔄 Admin list আপডেট হয়েছে');
+  }
+  function restoreOldId() {
+    const v = prompt('আগের Access ID দিন (MSC-XXXX-XXXX-XXXX):', '');
+    if (!v) return;
+    const id = v.trim().toUpperCase();
+    if (!/^MSC-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(id)) { alert('ID-র ফরম্যাট ঠিক নয়।'); return; }
+    GM_setValue('accessId', id);
+    ACCESS_ID = id;
+    toast('♻️ Access ID ফিরিয়ে আনা হয়েছে');
+    refreshStatus();
   }
 
   // ================= Tampermonkey মেনু =================
@@ -523,23 +761,32 @@
     clearMenus();
     menusReady = true;
     const add = (t, f) => { try { menuIds.push(GM_registerMenuCommand(t, f)); } catch (e) { /* ignore */ } };
-    add('📋 Access ID কপি', copyId);
-    add('🔄 Check Update', checkUpdate);
-    add('ℹ️ Status দেখুন', () => alert(`Status: ${LABELS[status]}\nAccess ID: ${ACCESS_ID}\nVersion: ${SCRIPT_VERSION}`));
     if (status === 'ACTIVE') {
+      add('🩺 Scan debug (কেন Status নেই?)', debugScan);
+      add('🔍 এই পেজ কেন ব্লক?', whyBlocked);
+      add('📥 আজকের Spreadsheet (CSV)', () => downloadCsv('today', startOfToday()));
+      add('📥 গত ১৫ দিন (CSV)', () => downloadCsv('last-15-days', Date.now() - 15 * DAY));
+      add('📥 সব সংরক্ষিত (CSV)', () => downloadCsv('all', 0));
+      add('💾 Backup (JSON: লক + Log)', backup);
+      add('📤 Import backup (মার্জ)', importBackup);
+      add(`⚙️ Auto-lock সম্পন্ন Survey: ${autoLockDays() ? autoLockDays() + ' দিন' : 'বন্ধ'} (বদলান)`, setAutoLock);
       add('🔒 এই Survey ৭ দিন লক', () => addLock('survey', 7));
       add('🔒 এই Survey ১৫ দিন লক', () => addLock('survey', 15));
       add('🔒 এই Survey ৩০ দিন লক', () => addLock('survey', 30));
       add('🔒 এই Site ৩০ দিন লক', () => addLock('site', 30));
       add('🔓 এই পেজের লক খুলুন', unlockHere);
       add('📃 লক তালিকা', showLocks);
-      add('📊 Survey Log', showLog);
-      add('🚫 Blocklist তথ্য', () => {
-        const n = (a) => (Array.isArray(a) ? a.length : 0);
-        alert(`Blocklist:\n• Domain: ${n(cfg.blockedDomains)}\n• Keyword: ${n(cfg.blockedKeywords)}\n• Survey: ${n(cfg.blockedSurveys)}`);
-      });
+      add('📊 Survey Log (শেষ ২০)', showLog);
+      add('🗂️ Blocked history (শেষ ৫০)', showBlockedHistory);
       add('🗑️ Log মুছুন', clearLog);
     }
+    add(`ℹ️ Version ${SCRIPT_VERSION} (চলছে)`, () => alert(`My Survey Control v${SCRIPT_VERSION}`));
+    add('⬆️ Check for script update', checkUpdate);
+    add('🔐 Privacy তথ্য', () => alert('নেটওয়ার্ক শুধু GitHub-এর config.json পড়তে ও Update যাচাইয়ে ব্যবহার হয়।\nSurvey Log, লক ও Blocked history শুধু এই ব্রাউজারে থাকে, কোথাও পাঠানো হয় না।'));
+    add(`🛡️ Admin list (${countOf(cfg.blockedDomains)} domains, ${countOf(cfg.blockedKeywords)} keywords, ${countOf(cfg.blockedSurveys)} surveys, ${countOf(cfg.allowedIds)} allowed)`, showListInfo);
+    add('🔄 Admin list এখনই রিফ্রেশ', refreshListNow);
+    add(`🔑 Access ID: ${ACCESS_ID} (${status === 'ACTIVE' ? 'Active ✅' : status})`, copyId);
+    add('♻️ আমার পুরনো Access ID ফিরিয়ে আনুন', restoreOldId);
   }
 
   render();
