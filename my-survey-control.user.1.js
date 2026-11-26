@@ -16,7 +16,7 @@
   'use strict';
 
   // ====== আপনাকে শুধু এই দুটি লাইন বদলাতে হবে ======
-  const GITHUB_USER = 'YOUR_GITHUB_USERNAME';
+  const GITHUB_USER = 'sagorking1';
   const GITHUB_REPO = 'my-survey-guard';
   // ================================================
 
