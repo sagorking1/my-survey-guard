@@ -12,6 +12,20 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ==UserScript==
+// @name         My Survey Control
+// @namespace    my-survey-guard
+// @version      1.3.0
+// @description  Admin Approval System: PENDING -> ACTIVE / BLOCKED
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_setClipboard
+// @connect      raw.githubusercontent.com
+// @run-at       document-idle
+// ==/UserScript==
+
 (function () {
   'use strict';
 
